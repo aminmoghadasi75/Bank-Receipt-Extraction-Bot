@@ -1,7 +1,16 @@
-import fs from 'fs';
 import path from 'path';
-import qrcode from 'qrcode-terminal';
-import { Client, LocalAuth, Message, MessageMedia } from 'whatsapp-web.js';
+import fs from 'fs';
+import pino from 'pino';
+import qrcodeTerminal from 'qrcode-terminal';
+import QRCode from 'qrcode';
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadContentFromMessage,
+  proto,
+  WASocket,
+  WAMessage,
+} from '@whiskeysockets/baileys';
 import {
   extractReceipt,
   registerReplyId,
@@ -9,466 +18,414 @@ import {
   checkApiHealth,
 } from './apiClient.js';
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+// ─── Paths & Folders ──────────────────────────────────────────────────────────
 
-const SESSION_DATA_PATH = path.join(__dirname, '..', '.wwebjs_auth');
-const CACHE_DATA_PATH = path.join(__dirname, '..', '.wwebjs_cache');
-const WEB_VERSION_CACHE_URL =
-  process.env.WEB_VERSION_CACHE_URL ??
-  'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1018949068-alpha.html';
-const HTTP_PROXY =
-  process.env.HTTP_PROXY ?? process.env.http_proxy ?? 'http://127.0.0.1:10808';
-const RESET_WHATSAPP_SESSION = process.env.RESET_WHATSAPP_SESSION === 'true';
+const AUTH_INFO_DIR = path.join(__dirname, '..', 'auth_info_baileys');
+const DOWNLOADS_DIR = path.join(__dirname, '..', 'downloaded_test_images');
 
-// ─── Clean up stale Chromium singleton lock files from previous runs ──────────
-
-function cleanStaleLocks(): void {
-  const sessionDir = path.join(SESSION_DATA_PATH, 'session');
-  for (const file of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-    const lockPath = path.join(sessionDir, file);
-    if (fs.existsSync(lockPath)) {
-      try {
-        fs.unlinkSync(lockPath);
-        console.log(`🧹 Removed stale lock: ${file}`);
-      } catch {
-        // ignore
-      }
-    }
-  }
+if (!fs.existsSync(DOWNLOADS_DIR)) {
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
 
-function removeSessionCache(): void {
-  if (!RESET_WHATSAPP_SESSION) return;
+// ─── State Management for Web UI ──────────────────────────────────────────────
 
-  if (fs.existsSync(SESSION_DATA_PATH)) {
-    try {
-      fs.rmSync(SESSION_DATA_PATH, { recursive: true, force: true });
-      console.log('🧹 Removed old WhatsApp session directory (.wwebjs_auth).');
-    } catch (err) {
-      console.warn('⚠️ Could not remove .wwebjs_auth:', err);
-    }
-  }
-
-  if (fs.existsSync(CACHE_DATA_PATH)) {
-    try {
-      fs.rmSync(CACHE_DATA_PATH, { recursive: true, force: true });
-      console.log('🧹 Removed old WhatsApp cache directory (.wwebjs_cache).');
-    } catch (err) {
-      console.warn('⚠️ Could not remove .wwebjs_cache:', err);
-    }
-  }
+export interface SavedImageInfo {
+  id: string;
+  sender: string;
+  timestamp: string;
+  fileName: string;
+  filePath: string;
+  mimeType: string;
+  sizeKB: number;
+  imageBase64: string;
+  fromMe: boolean;
+  extractionResult?: any;
 }
 
-// ─── Build WhatsApp client ────────────────────────────────────────────────────
+export interface BotState {
+  connectionStatus: 'connecting' | 'qr_ready' | 'connected' | 'disconnected';
+  qrDataUrl: string | null;
+  userJid: string | null;
+  recentImages: SavedImageInfo[];
+  logs: Array<{ timestamp: string; level: 'info' | 'warn' | 'error'; text: string }>;
+}
 
-export function buildClient(): Client {
-  cleanStaleLocks();
+const botState: BotState = {
+  connectionStatus: 'connecting',
+  qrDataUrl: null,
+  userJid: null,
+  recentImages: [],
+  logs: [],
+};
 
-  const puppeteerArgs = [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--disable-gpu',
-    // اضافه کردن User-Agent استاندارد برای جلوگیری از مسدود شدن دانلودها توسط واتساپ
-    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  ];
+function addLog(level: 'info' | 'warn' | 'error', text: string) {
+  const timestamp = new Date().toLocaleTimeString('fa-IR');
+  botState.logs.unshift({ timestamp, level, text });
+  if (botState.logs.length > 50) botState.logs.pop();
+  console.log(`[${timestamp}] [${level.toUpperCase()}] ${text}`);
+}
 
-  const proxy = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || 'http://127.0.0.1:10808';
-  if (proxy) {
-    puppeteerArgs.push(`--proxy-server=${proxy}`);
+export function getBotState(): BotState {
+  return botState;
+}
+
+// Cache to prevent duplicate processing of messages
+const processedMsgIds = new Set<string>();
+const MAX_PROCESSED_CACHE = 1000;
+
+function trackProcessedMsg(id: string): boolean {
+  if (processedMsgIds.has(id)) {
+    return true;
+  }
+  processedMsgIds.add(id);
+  if (processedMsgIds.size > MAX_PROCESSED_CACHE) {
+    const firstKey = processedMsgIds.values().next().value;
+    if (firstKey) processedMsgIds.delete(firstKey);
+  }
+  return false;
+}
+
+// ─── Media Downloader ─────────────────────────────────────────────────────────
+
+async function downloadImageBuffer(
+  imageMsg: proto.IMessage['imageMessage']
+): Promise<{ buffer: Buffer; mimeType: string }> {
+  if (!imageMsg) {
+    throw new Error('Image message is undefined');
   }
 
-  return new Client({
-    authStrategy: new LocalAuth({ dataPath: SESSION_DATA_PATH }),
-    // اضافه کردن مجدد webVersionCache که در فرآیند تبدیل به TS حذف شده بود
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-    },
-    puppeteer: {
-      headless: true, // استفاده از true به جای 'new'
-      timeout: 120000,
-      args: puppeteerArgs,
-    },
-  });
+  const stream = await downloadContentFromMessage(imageMsg, 'image');
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  const buffer = Buffer.concat(chunks);
+  const mimeType = imageMsg.mimetype ?? 'image/jpeg';
+  return { buffer, mimeType };
 }
 
-// ─── Event handlers ───────────────────────────────────────────────────────────
+// ─── Image Processing Handler ─────────────────────────────────────────────────
 
-async function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+async function handleImage(
+  sock: WASocket,
+  msg: WAMessage,
+  imageMsg: proto.IMessage['imageMessage']
+): Promise<void> {
+  const remoteJid = msg.key.remoteJid;
+  if (!remoteJid) return;
 
-async function customDownloadMedia(
-  client: Client,
-  msg: Message,
-): Promise<MessageMedia | undefined> {
+  const msgId = msg.key.id ?? `msg_${Date.now()}`;
+  const fromMe = msg.key.fromMe ?? false;
+
+  addLog('info', `📷 دریافت تصویر از ${remoteJid} (fromMe=${fromMe})`);
+
+  let media: { buffer: Buffer; mimeType: string };
   try {
-    const standardMedia = await msg.downloadMedia();
-    if (standardMedia && standardMedia.data) {
-      return standardMedia;
-    }
+    media = await downloadImageBuffer(imageMsg);
   } catch (err) {
-    console.warn('⚠️ Standard downloadMedia failed, trying browser fallback extraction...');
-  }
-
-  const msgId = msg.id._serialized;
-  if (!client.pupPage) {
-    return undefined;
-  }
-
-  try {
-    const fallback = await client.pupPage.evaluate(async (targetId) => {
-      const globalAny = globalThis as any;
-      const win = globalAny.window || globalAny;
-      const doc: any = win.document;
-      const Store = win.Store ?? win?.Store;
-
-      let msgObj = Store?.Msg?.get?.(targetId);
-      if (!msgObj && win?.require) {
-        try {
-          msgObj = win.require('WAWebCollections')?.Msg?.get?.(targetId);
-        } catch {
-          // ignore
-        }
-      }
-
-      if (!msgObj && Store?.Msg?.models) {
-        try {
-          for (const value of Store.Msg.models.values()) {
-            const candidateId =
-              value?.id?._serialized ?? value?.id?.serialized ?? value?.id;
-            if (candidateId === targetId || String(candidateId) === targetId) {
-              msgObj = value;
-              break;
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      if (msgObj) {
-        let blob = msgObj?.mediaData?.blob;
-        if (!blob && typeof msgObj.downloadMedia === 'function') {
-          try {
-            await msgObj.downloadMedia({
-              downloadEvenIfExpensive: true,
-              rmrReason: 1,
-            });
-            blob = msgObj?.mediaData?.blob;
-          } catch {
-            // ignore
-          }
-        }
-
-        if (blob) {
-          const buffer = await blob.arrayBuffer();
-          const bytes = new Uint8Array(buffer);
-          let binary = '';
-          for (let i = 0; i < bytes.length; i += 1) {
-            binary += String.fromCharCode(bytes[i]);
-          }
-          const base64 = win.btoa ? win.btoa(binary) : '';
-          return {
-            data: base64,
-            mimetype: msgObj?.mimetype || blob.type || 'image/jpeg',
-            filename: msgObj?.filename,
-          };
-        }
-      }
-
-      const selectors = [
-        `[data-id="${targetId}"] img[src^="blob:"], [data-id="${targetId}"] source[src^="blob:"], [data-id="${targetId}"] [style*="blob:"]`,
-        'img[src^="blob:"], source[src^="blob:"], [style*="blob:"]',
-      ];
-
-      let blobUrl: string | null = null;
-      for (const selector of selectors) {
-        const element = doc?.querySelector(selector) as any;
-        if (!element) continue;
-
-        if (element?.src && typeof element.src === 'string') {
-          blobUrl = element.src;
-        } else if (element?.getAttribute) {
-          const style = element.getAttribute('style') || '';
-          const match = style.match(/(blob:[^"'\s]+)/);
-          if (match) {
-            blobUrl = match[1];
-          }
-        }
-
-        if (blobUrl) break;
-      }
-
-      if (!blobUrl && doc?.querySelector) {
-        const img = doc.querySelector('img[src^="blob:"]') as any;
-        if (img?.src) {
-          blobUrl = img.src;
-        }
-      }
-
-      if (blobUrl && typeof win.fetch === 'function') {
-        const resp = await win.fetch(blobUrl);
-        const fetchedBlob = await resp.blob();
-        const buffer = await fetchedBlob.arrayBuffer();
-        const bytes = new Uint8Array(buffer);
-        let binary = '';
-        for (let i = 0; i < bytes.length; i += 1) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        const base64 = win.btoa ? win.btoa(binary) : '';
-        return {
-          data: base64,
-          mimetype: fetchedBlob.type || 'image/jpeg',
-        };
-      }
-
-      return null;
-    }, msgId);
-
-    if (fallback && fallback.data) {
-      return new MessageMedia(
-        fallback.mimetype ?? 'image/jpeg',
-        fallback.data,
-        fallback.filename ?? 'receipt.jpg',
-      );
-    }
-  } catch (fallbackErr) {
-    console.error('❌ Fallback media extraction error:', fallbackErr);
-  }
-
-  return undefined;
-}
-
-async function downloadMediaWithRetry(
-  client: Client,
-  msg: Message,
-  retries = 8,
-  delayMs = 2500
-): Promise<MessageMedia | undefined> {
-  await wait(2200);
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      console.log(`⏳ Downloading media (attempt ${attempt}/${retries})...`);
-      const media = await customDownloadMedia(client, msg);
-      const length = media?.data?.length ?? 0;
-      if (media && length > 0) {
-        return media;
-      }
-
-      console.warn(
-        `⚠️ Attempt ${attempt}/${retries}: Media not ready. ` +
-          `from=${msg.from} hasMedia=${msg.hasMedia} type=${msg.type} dataLength=${length}`
-      );
-    } catch (err) {
-      const errStr = err instanceof Error ? err.message : String(err);
-      console.warn(`⚠️ Download media attempt ${attempt}/${retries} failed:`, errStr);
-    }
-
-    if (attempt < retries) {
-      await wait(delayMs * attempt);
-    }
-  }
-  return undefined;
-}
-
-async function handleImage(client: Client, msg: Message): Promise<void> {
-  console.log(`📷 Image from ${msg.from} (fromMe=${msg.fromMe})`);
-
-  let media: MessageMedia | undefined;
-  try {
-    media = await downloadMediaWithRetry(client, msg);
-  } catch (err) {
-    console.error('❌ Failed to download media after retries:', err);
-    await msg.reply('❌ خطا در دانلود تصویر از واتساپ. لطفاً پس از چند ثانیه مجدداً تصویر را ارسال کنید.');
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    addLog('error', `❌ دانلود تصویر ناموفق بود: ${errorMsg}`);
+    await sock.sendMessage(
+      remoteJid,
+      { text: '❌ خطا در دانلود تصویر از واتساپ. لطفاً پس از چند ثانیه مجدداً تصویر را ارسال کنید.' },
+      { quoted: msg }
+    );
     return;
   }
 
-  if (!media?.data) {
-    console.error('❌ Media data is empty.');
-    await msg.reply('❌ فایل تصویر خالی یا نامعتبر بود.');
+  if (!media.buffer || media.buffer.length === 0) {
+    addLog('error', '❌ بفر تصویر خالی است.');
+    await sock.sendMessage(
+      remoteJid,
+      { text: '❌ فایل تصویر خالی یا نامعتبر بود.' },
+      { quoted: msg }
+    );
     return;
   }
 
-  console.log(`⏳ Sending ${media.data.length} chars to FastAPI...`);
+  // Save image copy locally in isolated folder
+  const ext = media.mimeType.includes('png') ? 'png' : 'jpg';
+  const fileName = `receipt_${Date.now()}_${msgId.replace(/[^a-zA-Z0-9]/g, '_')}.${ext}`;
+  const filePath = path.join(DOWNLOADS_DIR, fileName);
 
+  fs.writeFileSync(filePath, media.buffer);
+  const sizeKB = Math.round((media.buffer.length / 1024) * 10) / 10;
+  const base64Data = media.buffer.toString('base64');
+
+  const savedInfo: SavedImageInfo = {
+    id: msgId,
+    sender: remoteJid,
+    timestamp: new Date().toLocaleTimeString('fa-IR'),
+    fileName,
+    filePath,
+    mimeType: media.mimeType,
+    sizeKB,
+    imageBase64: base64Data,
+    fromMe,
+  };
+
+  botState.recentImages.unshift(savedInfo);
+  if (botState.recentImages.length > 20) botState.recentImages.pop();
+
+  addLog('info', `💾 تصویر با موفقیت ذخیره شد: ${fileName} (${sizeKB} KB)`);
+
+  // Call FastAPI backend
   let result;
   try {
+    addLog('info', '⏳ ارسال تصویر به سرور FastAPI جهت استخراج اطلاعات...');
     result = await extractReceipt({
-      image_base64: media.data,
-      mime_type: media.mimetype ?? 'image/jpeg',
-      whatsapp_message_id: msg.id._serialized,
-      chat_id: msg.from,
+      image_base64: base64Data,
+      mime_type: media.mimeType,
+      whatsapp_message_id: msgId,
+      chat_id: remoteJid,
     });
+    savedInfo.extractionResult = result;
   } catch (err) {
-    const msg2 = err instanceof Error ? err.message : String(err);
-    console.error('❌ extractReceipt error:', msg2);
+    const errMessage = err instanceof Error ? err.message : String(err);
+    addLog('error', `❌ خطا در سرور FastAPI: ${errMessage}`);
 
-    const isDown = msg2.includes('ECONNREFUSED');
-    await msg.reply(
-      isDown
-        ? '❌ سرور پردازش خاموش است. لطفاً ابتدا `python main.py` را اجرا کنید.'
-        : `❌ خطا در پردازش فیش:\n${msg2}`
+    const isDown = errMessage.includes('ECONNREFUSED');
+    await sock.sendMessage(
+      remoteJid,
+      {
+        text: isDown
+          ? '❌ سرور پردازش خاموش است. لطفاً ابتدا `python main.py` را اجرا کنید.'
+          : `❌ خطا در پردازش فیش:\n${errMessage}`,
+      },
+      { quoted: msg }
     );
     return;
   }
 
   if (!result.success || !result.formatted_text) {
-    console.warn('⚠️  Extraction failed:', result.error);
-    await msg.reply(`❌ خطا در استخراج اطلاعات:\n${result.error ?? 'ناشناخته'}`);
+    addLog('warn', `⚠️ استخراج اطلاعات ناموفق: ${result.error ?? 'علت نامشخص'}`);
+    await sock.sendMessage(
+      remoteJid,
+      { text: `❌ خطا در استخراج اطلاعات:\n${result.error ?? 'ناشناخته'}` },
+      { quoted: msg }
+    );
     return;
   }
 
-  console.log(`✅ Extracted (ID: ${result.receipt_id})`);
-  const sentMsg = await msg.reply(result.formatted_text);
+  addLog('info', `✅ استخراج موفق فیش شماره #${result.receipt_id}`);
+  const sentMsg = await sock.sendMessage(
+    remoteJid,
+    { text: result.formatted_text },
+    { quoted: msg }
+  );
 
-  if (sentMsg?.id?._serialized) {
+  if (sentMsg?.key?.id && result.receipt_id) {
     await registerReplyId({
       receipt_id: result.receipt_id,
-      reply_message_id: sentMsg.id._serialized,
+      reply_message_id: sentMsg.key.id,
     });
   }
 }
 
-async function handleConfirmation(msg: Message): Promise<void> {
-  console.log(`🔄 Confirmation command from ${msg.from}`);
+// ─── Confirmation Command Handler ─────────────────────────────────────────────
 
-  let replyMsgId: string | undefined;
-  let quotedMsg: Message | undefined;
+async function handleConfirmation(
+  sock: WASocket,
+  msg: WAMessage,
+  contextInfo?: proto.IContextInfo | null
+): Promise<void> {
+  const remoteJid = msg.key.remoteJid;
+  if (!remoteJid) return;
 
-  if (msg.hasQuotedMsg) {
-    try {
-      quotedMsg = await msg.getQuotedMessage();
-      replyMsgId = quotedMsg?.id?._serialized;
-    } catch (err) {
-      console.warn('⚠️  Could not get quoted message:', err);
-    }
-  }
+  addLog('info', `🔄 دستور تایید فیش از ${remoteJid}`);
+
+  const replyMsgId = contextInfo?.stanzaId ?? undefined;
 
   let result;
   try {
     result = await confirmReceipt({
       reply_message_id: replyMsgId,
-      chat_id: msg.from,
+      chat_id: remoteJid,
     });
   } catch (err) {
-    console.error('❌ confirmReceipt error:', err);
-    await msg.reply('❌ خطا در تایید فیش در پایگاه داده.');
+    addLog('error', `❌ خطا در ثبت تایید: ${err}`);
+    await sock.sendMessage(
+      remoteJid,
+      { text: '❌ خطا در تایید فیش در پایگاه داده.' },
+      { quoted: msg }
+    );
     return;
   }
 
   if (!result.success) {
-    console.warn('⚠️  Confirm failed:', result.error);
-    await msg.reply(
-      `⚠️ فیش در انتظار تایید یافت نشد.\n${result.error ?? ''}`
+    addLog('warn', `⚠️ عدم وجود فیش تایید نشده: ${result.error}`);
+    await sock.sendMessage(
+      remoteJid,
+      { text: `⚠️ فیش در انتظار تایید یافت نشد.\n${result.error ?? ''}` },
+      { quoted: msg }
     );
     return;
   }
 
-  console.log(`✅ Receipt ${result.receipt_id} CONFIRMED`);
+  addLog('info', `✅ فیش #${result.receipt_id} با موفقیت تایید شد.`);
 
-  // Try to edit the quoted bot message
   let edited = false;
-  if (quotedMsg && typeof (quotedMsg as Message & { edit?: (text: string) => Promise<void> }).edit === 'function') {
+  if (replyMsgId) {
     try {
-      await (quotedMsg as Message & { edit: (text: string) => Promise<void> }).edit(
-        result.updated_text
-      );
+      await sock.sendMessage(remoteJid, {
+        text: result.updated_text,
+        edit: {
+          remoteJid,
+          fromMe: true,
+          id: replyMsgId,
+        },
+      });
       edited = true;
-      console.log('✏️  Message edited successfully.');
+      addLog('info', '✏️ متن پیام قبلی ادیت شد.');
     } catch (editErr) {
-      console.warn('⚠️  Edit failed (WhatsApp limit):', editErr);
+      addLog('warn', `⚠️ امکان ویرایش پیام قبلی وجود نداشت: ${editErr}`);
     }
   }
 
   if (!edited) {
-    await msg.reply('✅ اطلاعات فیش بانکی با موفقیت تایید شد.');
+    await sock.sendMessage(
+      remoteJid,
+      { text: '✅ اطلاعات فیش بانکی با موفقیت تایید شد.' },
+      { quoted: msg }
+    );
   }
 }
 
-// ─── Register all client events ───────────────────────────────────────────────
+// ─── Baileys Client Lifecycle ─────────────────────────────────────────────────
 
-export function registerEvents(client: Client): void {
-  client.on('qr', (qr: string) => {
-    console.log('\n📲 QR Code - اسکن کنید:\n');
-    qrcode.generate(qr, { small: true });
+let activeSocket: WASocket | null = null;
+
+export async function startBot(): Promise<WASocket> {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_INFO_DIR);
+  const logger = pino({ level: 'silent' });
+
+  botState.connectionStatus = 'connecting';
+  addLog('info', '🔄 در حال راه‌اندازی بات واتساپ (Baileys)...');
+
+  const sock = makeWASocket({
+    auth: state,
+    logger,
+    printQRInTerminal: false,
   });
 
-  client.on('authenticated', () => {
-    console.log('🔑 Authentication successful!');
-  });
+  activeSocket = sock;
 
-  client.on('loading_screen', (percent: number, message: string) => {
-    console.log(`⏳ Loading: ${percent}% - ${message}`);
-  });
+  sock.ev.on('creds.update', saveCreds);
 
-  client.on('change_state', (state: string) => {
-    console.log(`🔄 State: ${state}`);
-  });
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-  client.on('ready', async () => {
-    console.log('══════════════════════════════════════════');
-    console.log('✅ WhatsApp Bot is READY!');
-    console.log('══════════════════════════════════════════');
+    if (qr) {
+      botState.connectionStatus = 'qr_ready';
+      try {
+        botState.qrDataUrl = await QRCode.toDataURL(qr);
+      } catch (e) {
+        botState.qrDataUrl = null;
+      }
+      addLog('info', '📲 کد QR آماده اسکن است! در مرورگر یا ترمینال اسکن کنید.');
+      qrcodeTerminal.generate(qr, { small: true });
+    }
 
-    const apiOk = await checkApiHealth();
-    if (!apiOk) {
-      console.warn('⚠️  FastAPI server is not reachable at 127.0.0.1:8000!');
-      console.warn('   Run: python main.py (in project root terminal)');
-    } else {
-      console.log('✅ FastAPI server is UP and healthy.');
+    if (connection === 'open') {
+      botState.connectionStatus = 'connected';
+      botState.qrDataUrl = null;
+      botState.userJid = sock.user?.id ?? null;
+
+      addLog('info', `✅ بات واتساپ متصل شد! حساب کاربری: ${sock.user?.id ?? 'فعال'}`);
+
+      const apiOk = await checkApiHealth();
+      if (!apiOk) {
+        addLog('warn', '⚠️ سرور FastAPI در 127.0.0.1:8000 در دسترس نیست.');
+      } else {
+        addLog('info', '✅ ارتباط با سرور FastAPI برقرار است.');
+      }
+    }
+
+    if (connection === 'close') {
+      botState.connectionStatus = 'disconnected';
+      const statusCode =
+        (lastDisconnect?.error as any)?.output?.statusCode ??
+        (lastDisconnect?.error as any)?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      addLog('warn', `⚠️ قطع ارتباط (کد: ${statusCode}). تلاش مجدد: ${shouldReconnect}`);
+
+      if (shouldReconnect) {
+        setTimeout(() => {
+          startBot().catch((err) =>
+            addLog('error', `❌ خطا در اتصال مجدد: ${err}`)
+          );
+        }, 3000);
+      } else {
+        addLog('error', '❌ جلسه کاری منقضی شد. پوشه auth_info_baileys را حذف کرده و مجدداً تلاش کنید.');
+      }
     }
   });
 
-  client.on('disconnected', (reason: string) => {
-    console.warn('⚠️  Disconnected:', reason);
-  });
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify' && type !== 'append') return;
 
-  client.on('auth_failure', (msg: string) => {
-    console.error('❌ Auth failure:', msg);
-  });
+    for (const msg of messages) {
+      if (!msg.key || !msg.message) continue;
 
-  // Use message_create to capture self-messages (Message Yourself)
-  client.on('message_create', async (msg: Message) => {
-    if (!msg?.from) return;
-
-    // Log all incoming/created messages for debugging
-    console.log(
-      `📩 [Message Event] from=${msg.from} | type=${msg.type} | hasMedia=${msg.hasMedia} | fromMe=${msg.fromMe}`
-    );
-
-    // Skip WhatsApp Status updates, newsletters, and broadcast channels
-    if (
-      msg.from === 'status@broadcast' ||
-      msg.from.endsWith('@broadcast') ||
-      msg.from.endsWith('@newsletter')
-    ) {
-      return;
-    }
-
-    try {
-      if (msg.hasMedia && msg.type === 'image') {
-        console.log('📷 Image detected! Processing receipt...');
-        await handleImage(client, msg);
-        return;
+      const remoteJid = msg.key.remoteJid;
+      if (
+        !remoteJid ||
+        remoteJid === 'status@broadcast' ||
+        remoteJid.endsWith('@broadcast') ||
+        remoteJid.endsWith('@newsletter')
+      ) {
+        continue;
       }
 
-      const body = (msg.body ?? '').trim();
+      const msgId = msg.key.id;
+      if (msgId && trackProcessedMsg(msgId)) {
+        continue;
+      }
+
+      const messageContent = msg.message;
+
+      // Extract image message
+      const imageMsg =
+        messageContent.imageMessage ||
+        messageContent.viewOnceMessage?.message?.imageMessage ||
+        messageContent.viewOnceMessageV2?.message?.imageMessage ||
+        messageContent.ephemeralMessage?.message?.imageMessage ||
+        messageContent.documentWithCaptionMessage?.message?.imageMessage;
+
+      // Extract text body
+      const body = (
+        messageContent.conversation ||
+        messageContent.extendedTextMessage?.text ||
+        imageMsg?.caption ||
+        ''
+      ).trim();
+
       const isConfirm = ['/تایید', '/confirm', 'تایید', '/تایید شده'].includes(
         body.toLowerCase()
       );
-      if (isConfirm) {
-        console.log('🔄 Confirmation command detected! Processing...');
-        await handleConfirmation(msg);
+
+      const contextInfo =
+        messageContent.extendedTextMessage?.contextInfo ||
+        messageContent.imageMessage?.contextInfo ||
+        (messageContent as any)[Object.keys(messageContent)[0]]?.contextInfo;
+
+      try {
+        if (imageMsg) {
+          await handleImage(sock, msg, imageMsg);
+        } else if (isConfirm) {
+          await handleConfirmation(sock, msg, contextInfo);
+        }
+      } catch (err) {
+        const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+        addLog('error', `❌ خطا در پردازش پیام: ${detail}`);
       }
-    } catch (err) {
-      const detail = err instanceof Error ? err.stack ?? err.message : String(err);
-      console.error('❌ Unhandled error in message_create:', detail);
     }
   });
+
+  return sock;
+}
+
+export function getSocket(): WASocket | null {
+  return activeSocket;
 }
