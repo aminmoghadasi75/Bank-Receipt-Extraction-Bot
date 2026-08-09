@@ -10,6 +10,7 @@ import makeWASocket, {
   proto,
   WASocket,
   WAMessage,
+  Browsers,
 } from '@whiskeysockets/baileys';
 import {
   extractReceipt,
@@ -305,7 +306,14 @@ export async function startBot(): Promise<WASocket> {
   const sock = makeWASocket({
     auth: state,
     logger,
+    browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
+    qrTimeout: 60000,
+    syncFullHistory: false,
+    generateHighQualityLinkPreview: false,
   });
 
   activeSocket = sock;
