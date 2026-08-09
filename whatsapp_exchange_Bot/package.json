@@ -5,8 +5,8 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
-    "dev": "ts-node src/server.ts"
+    "start": "npm run build && node dist/server.js",
+    "dev": "npx tsx src/server.ts"
   },
   "dependencies": {
     "@types/qrcode": "^1.5.6",

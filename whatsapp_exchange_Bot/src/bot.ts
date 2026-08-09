@@ -11,6 +11,7 @@ import makeWASocket, {
   WASocket,
   WAMessage,
   Browsers,
+  fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
 import {
   extractReceipt,
@@ -303,10 +304,20 @@ export async function startBot(): Promise<WASocket> {
   botState.connectionStatus = 'connecting';
   addLog('info', '🔄 در حال راه‌اندازی بات واتساپ (Baileys)...');
 
+  let version: [number, number, number] | undefined;
+  try {
+    const fetched = await fetchLatestBaileysVersion();
+    version = fetched.version;
+    addLog('info', `📱 نسخه‌ پروتکل واتساپ: v${version.join('.')} (جدیدترین: ${fetched.isLatest})`);
+  } catch (err) {
+    addLog('warn', `⚠️ خطا در دریافت نسخه‌ اخیر پروتکل واتساپ، استفاده از نسخه پیش‌فرض: ${err}`);
+  }
+
   const sock = makeWASocket({
+    version,
     auth: state,
     logger,
-    browser: Browsers.ubuntu('Chrome'),
+    browser: Browsers.macOS('Desktop'),
     printQRInTerminal: false,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
